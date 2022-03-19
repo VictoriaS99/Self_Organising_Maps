@@ -1,0 +1,458 @@
+#set work dir
+setwd("M:/Visual Analytics/SOM")
+
+#import all required libraries
+library(kohonen)
+library(Rcpp)
+library(ggplot2)
+library(sf)
+library(rgdal)
+library(gridExtra)
+library(grid)
+library(viridis)
+library(dplyr)
+library(caret) #streamlined library for data preparation for machine learning models
+library(RColorBrewer)
+library(cluster) #library for k-means analysis
+library(factoextra) #complementary library to the 'cluster' package for visualising k-means
+
+#read in csv
+data <-
+  read.csv(file = "Assessment Data\\SIMD16 indicator data.csv", sep = ',', header =
+             TRUE)
+#filter to only Edi
+data <- data[1912:2508, ]
+
+#read in SIMD 2016 shp
+#do not re-encode strings to factors (distinct groups) during loading
+edi_simd <-
+  readOGR("Assessment Data\\SG_SIMD_2016_EDINBURGH.shp",
+          stringsAsFactors = FALSE)
+
+
+#DATA PROCESSING -----
+#project spatial polygon to WGS84
+edi_map_sdf <-
+  spTransform(edi_simd,
+              CRS("+proj=longlat +ellps=WGS84
+                                            +datum=WGS84 +no_defs"))
+
+#convert spatial df to normal df
+edi_map_df <- as.data.frame(edi_map_sdf)
+
+#fortify spatial df to attach lat and long
+#this is to allow for plotting
+edi_fort <- fortify(edi_map_sdf, region = "DataZone")
+
+#as fortify loses the relational join between the df and its fortified ver
+#need to merge the two back together
+edi_fort <-
+  merge(edi_fort, edi_map_df, by.x = "id", by.y = "DataZone")
+
+
+#test to see if I can create a plot using the fortified
+#Employment Rank map
+ggplot(data = edi_fort, aes(
+  x = long,
+  y = lat,
+  fill = EmpRank,
+  group = group
+)) +
+  scale_fill_viridis(name = "Employment Rank") + #name of scale
+  geom_polygon(colour = NA) +
+  theme_void(
+    base_size = 15,
+    #controls size of the plot
+    base_family = "",
+    base_line_size = base_size / 22,
+    base_rect_size = base_size / 22
+  ) + #used to control non-data displays
+  coord_equal() #streetch map to scale
+
+#export csv so I can inspect the df more clearly outwith the design constraints of R
+#write.csv(edi_fort,"M:/Visual Analytics/SOM/edi_fort.csv", row.names = FALSE)
+
+#establish vars to be analysed
+#these will be analysed as per the SIMD domains
+
+##Income ------
+#select relevant col and transform to numeric value
+income <- edi_map_df[, 10]
+
+
+##Employment ----
+#repeat for employment
+employment <- edi_map_df[, 13]
+
+
+
+##Health -----
+#extract all relevant cols
+health <- subset(edi_map_df, select = c(16, 17, 18, 19, 20, 21, 22))
+
+#using preProcess class from 'caret' library to scale/normalise data from 0-1
+health_norm <- preProcess(health, method = c("range"))
+health_norm <- predict(health_norm, health[, c(1, 2, 3, 4, 5, 6, 7)])
+
+#check to see whether normalisation was a success; max values should all be 1
+summary(health_norm)
+
+#sum all rows in normalised dataset to form overall health domain variable
+health_all <- rowSums(health_norm[, c(1, 2, 3, 4, 5, 6, 7)])
+
+
+##Education ----
+#repeat all steps above for education domain
+edu <- subset(edi_map_df, select = c(24, 25, 26, 27, 28))
+
+#normalise
+edu_norm <- preProcess(edu, method = c("range"))
+edu_norm <- predict(edu_norm, edu[, c(1, 2, 3, 4, 5)])
+
+summary(edu_norm)
+
+edu_all <- rowSums(edu_norm[, c(1, 2, 3, 4, 5)])
+
+##Access ----
+#repeat steps for access domain
+access <- subset(edi_map_df, select = c(30, 31, 32, 33, 34, 35, 36, 37, 38))
+
+access_norm <- preProcess(access, method = c("range"))
+access_norm <- predict(access_norm, access[, c(1, 2, 3, 4, 5, 6, 7, 8, 9)])
+
+summary(access_norm)
+
+access_all <- rowSums(access_norm[, c(1, 2, 3, 4, 5, 6, 7, 8, 9)])
+
+
+##Crime ----
+#extraction only necessary
+#rates chosen over raw count as it allows comparison based on underlying population distribution
+#https://doh.wa.gov/sites/default/files/legacy/Documents/1500//Rateguide.pdf
+crime <- subset(edi_map_df, select = c(41))
+#need for converting factor to numeric here
+crime <- as.numeric(as.character(unlist(crime)))
+
+
+##Housing -----
+#repeat again for housing domain
+housing <- subset(edi_map_df, select = c(45, 46))
+
+housing_norm <- preProcess(housing, method = c("range"))
+housing_norm <- predict(housing_norm, housing[, c(1, 2)])
+
+summary(housing_norm)
+
+housing_all <- rowSums(housing_norm[, c(1, 2)])
+
+#Creation of Domain Matrix taking in all normalised individual domains above ----
+#sum all domains into a matrix for greater efficiency when running code
+#nrow set to the length of any domain var to ensure each column captures one domain only
+domains_all <-
+  as.data.frame(matrix(
+    c(
+      income,
+      employment,
+      health_all,
+      access_all,
+      edu_all,
+      crime,
+      housing_all
+    ),
+    nrow = length(access_all)
+  ))
+
+#rename to SIMD domain names
+names(domains_all) <-
+  c("Income",
+    "Employment",
+    "Health",
+    "Access",
+    "Education",
+    "Crime",
+    "Housing")
+
+#standardise all values in combined domains matrix
+#domains_scaled <- scale(domains_all)
+domains_scaled <- as.matrix(scale(domains_all))
+#domains_scaled <- preProcess(domains_all, method=c("range"))
+#domains_scaled<- predict(domains_scaled,domains_all[,c(1,2,3,4,5,6,7)])
+
+
+
+#phew...I made it through the data processing stage, so now let's roll on model training!
+
+#SOM Model Set-Up ----
+
+#first set.seed to ensure repeatability in future runs
+#value can be random, i.e. has no meaning
+set.seed(56)
+
+#define SOM grid size and topology
+#"One-Half" rule of grid size
+#som_grid <- somgrid(xdim = 56, ydim = 50, topo="hexagonal",  neighbourhood.fct = "gaussian")
+som_grid <-
+  somgrid(
+    xdim = 13,
+    ydim = 10,
+    topo = "hexagonal",
+    neighbourhood.fct = "gaussian"
+  )
+
+#train model
+som_model <- som(
+  domains_scaled,
+  grid = som_grid,
+  rlen = 800,
+  alpha = c(0.01, 0.01),
+  keep.data = TRUE
+)
+
+
+
+
+#testing for the efficacy of the trained model
+summary(som_model)
+
+#first calculate mean distances between node and the respective closest unit in the map
+meanD <- mean(som_model$distances)
+
+#next, calculate the distances between units in the som grid
+#gives indication of distance prior to mapping/plotting
+meanunitD <- mean(unit.distances(som_grid))
+
+#MeanD is the distances that are "left over" when we use the map.
+#The difference between the distances going in and whats left when we are done training model
+#are the distances we have accounted for.
+AccountedD <- meanunitD - meanD
+
+#Divide the distances accounted for by the mean distances prior to mapping.
+#The ratio should say something about the efficiency.
+#An EF value close to 1 is best
+EF <- AccountedD / meanunitD
+print(EF) #the result obtained suggests the model is pretty good!!
+
+
+#inspect SOM outcome
+#plot indicates whether rlen needs to be manipulated
+plot(som_model, type = "changes")
+#we can see tha the minimum plateau is reached at around 420 iterations --> indicative the model is stable and rlen
+#not necessary to be changed
+
+#define colour palette for plotting
+cols <- brewer.pal(10, "Paired")
+#Similarely, but a color function that will be called upon from inside other functions. Easy to change to rainbow, etc.
+terraincolors <- function(n, alpha = 1) {
+  terrain.colors(n, alpha = alpha)[n:1]
+}
+
+par(mfrow = c(1, 2))
+#map quality 1 (counts) -----
+plot(
+  som_model,
+  type = "count",
+  main = "Node Counts",
+  shape = "straight",
+  border = "transparent",
+  heatkey = TRUE,
+  heatkeywidth = 0.4
+)
+
+#map quality 2 (distance) ----
+plot(
+  som_model,
+  type = "quality",
+  main = "Node Quality/Distance",
+  shape = "straight",
+  heatkey = TRUE,
+  heatkeywidth = 0.4
+)
+
+par(mfrow = c(1, 1)) #reset plotting dimensions
+
+#U-matrix ----
+#the lower the distance value the more similar the nodes
+plot(
+  som_model,
+  type = "dist.neighbours",
+  main = "SOM neighbour distances",
+  shape = "straight",
+  palette.name = grey.colors,
+  border = "black"
+)
+
+#clustering of som -----
+#extract codebook (reference) vectors from a kohonen object
+mydata <- getCodes(som_model)
+wcss <- (nrow(mydata) - 1) * sum(apply(mydata, 2, var))
+for (i in 2:13) {
+  wcss[i] <- sum(kmeans(mydata,
+                        centers = i)$withinss)
+} #1:13 is selected to allow exploration of what the optimal number of clusters are in WCSS plot
+
+#plot wcss
+#5 appears to be the "elbow point" from visual evaluation
+
+dev.new(width=10, height=10) #plotting an external graphical interface as axes were missing first time round
+plot(
+  wcss,
+  type = "b",
+  xlab = "Number of Clusters",
+  ylab = "Within groups sum of squares",
+  main = "Within cluster sum of squares (WCSS)"
+)
+
+# as the WCSS curve doesn't decrease monotomically after the elbow point, let's explore further...
+# compute gap statistic
+set.seed(123)
+gap_stat <- clusGap(mydata, FUN = kmeans, nstart = 20,
+                    K.max = 13, B = 50)
+# Print the result
+print(gap_stat, method = "firstmax")
+
+
+#visualise result
+fviz_gap_stat(gap_stat) + theme_minimal() + ggtitle("Gap Statistic")
+#the results from this reveal that actually 6 clusters is optimal since the gap statistic
+#is greatest (looking at the gap from the cluster and the preceding cluster)
+
+#visualise clusters on grid ------
+#take Euclidean distance between sample values for clustering
+#split into 6 categories
+som_cluster <- cutree(hclust(dist(getCodes(som_model))), 6)
+
+#define colours of clusters
+cbPalette <-
+  c("#CC79A7",
+    "#56B4E9",
+    "#009E73",
+    "#F0E442",
+    "#0072B2",
+    "#D55E00",
+    "#CC3545")
+
+#colour3 <- tricolor(som_model$grid, phi = c(pi/6, 0, -pi/6), offset = .5)
+#the above palette is useful to tease out the non-crisp boundaries in real life, but for the purpose of plotting onto a map
+#this wouldn't be so useful as boundary delineation isn't clear enough
+
+
+#plot clusters only -----
+set.seed(54) #again to ensure repeatability
+plot(som_model,
+     type = "mapping",
+     bg = cbPalette[som_cluster],
+     main = "Clusters with Circles")
+add.cluster.boundaries(som_model, som_cluster)
+
+#plot clusters with codebook vectors -----
+#more meaningful to see underlying variables contributing to clusters
+#line codebook vector plot
+#wavelength of line should be similar for each cluster
+plot(
+  som_model,
+  type = "codes",
+  codeRendering = "lines",
+  bg = cbPalette[som_cluster],
+  main =
+    "Clusters with Line Plots",
+  shape = "straight",
+  border = "black"
+)
+add.cluster.boundaries(som_model, som_cluster)
+
+#segment codebook vector plot
+plot(
+  som_model,
+  type = "codes",
+  bg = cbPalette[som_cluster],
+  main =
+    "Clusters with Codebook Vectors",
+  shape = "straight",
+  border = "grey"
+)
+add.cluster.boundaries(som_model, som_cluster)
+
+#plotting SOM to geographical space-----
+
+#let's see what kind of areas overlie these clusters to get a sense of the locations
+#first get names from shp
+dz_names <- edi_simd@data$Intermedia
+
+# find all duplicate values and set them to NA
+dz_names[duplicated(dz_names)] <- NA
+
+#find the index of the names which are not NA
+naset <- which(!is.na(dz_names))
+
+#take RANDOM sample of placenames with length less than 10 and set them as NA
+naset <- sample(naset, length(naset) - 10)
+dz_names[naset] <- NA
+#view the names which have been selected
+#View(which(!is.na(dz_names)))
+
+# Replot our data with labels=dz_names
+plot(
+  som_model,
+  type = "mapping",
+  bg = cbPalette[som_cluster],
+  main =
+    "Clusters",
+  labels = dz_names
+)
+add.cluster.boundaries(som_model, som_cluster)
+
+#ok... so on reflection this isn't THAT useful to me/user since the labels are overlapping too much --> visual overload
+
+
+#plotting som to shp file -------
+#create df of the dz id (from shp) and the cluster unit (vector counts to BMU) in each area
+cluster_details <-
+  data.frame(id = data$Data_Zone, cluster = som_cluster[som_model$unit.classif])
+#View(cluster_details)
+
+
+#merge our cluster details onto the fortified spatial polygon dataframe from earlier
+mappoints <- merge(edi_fort,  cluster_details, by = "id")
+
+# map clusters onto shp and colour by cluster using ggplot
+ggplot(data = mappoints,
+       aes(
+         x = long,
+         y = lat,
+         group = group,
+         fill = factor(cluster)
+       )) +
+  geom_polygon(colour = "grey") + #note: no need to define spatial polygon here as we have fortified and joined with shp
+  theme_void(
+    base_size = 15,
+    #controls size of the plot
+    base_family = "",
+    base_line_size = base_size / 22,
+    base_rect_size = base_size / 22
+  ) + coord_equal() +
+  scale_fill_manual(name = "Clusters", values = cbPalette)
+
+#combine the simd onto our original spatial polygon
+edi_map_clusters <-
+  merge(edi_simd, data, by.x = "DataZone", by.y = "Data_Zone")
+#merge cluster data to original spatial polygon
+edi_map_clusters <-
+  merge(edi_map_clusters,
+        cluster_details,
+        by.x = "DataZone",
+        by.y = "id")
+View(edi_map_clusters)
+
+
+#export edi_map_clusters as an esri shapefile using OGR -----
+#dsn = folder name
+#layer = name of shp to be exported
+#overwrite is true
+writeOGR(
+  obj = edi_map_clusters,
+  dsn = "SOM_outcome_map",
+  layer = "edi_map_clusters",
+  driver = "ESRI Shapefile",
+  check_exists = TRUE,
+  overwrite_layer = TRUE
+)
