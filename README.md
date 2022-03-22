@@ -2,3 +2,4 @@
 ## B112177
 
 Full documentation of code used to prepare, build and train the SOM.
+Prepared in partial fulfilent of the Visual Analytics course (2021-22).
