@@ -19,8 +19,7 @@ library(factoextra) #complements 'cluster' lib to visualise k-means statistic
 
 #read in csv
 data <-
- read.csv(file = "Assessment Data\\SIMD16 indicator data.csv", sep = ',', he
-ader = TRUE) 
+ read.csv(file = "Assessment Data\\SIMD16 indicator data.csv", sep = ',', header = TRUE) 
 
 #filter to only Edi
 data <- data[1912:2508, ]
