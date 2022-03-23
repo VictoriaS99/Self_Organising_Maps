@@ -55,7 +55,7 @@ edi_fort <-
 income <- edi_map_df[, 10]
 
 ##Employment ----
-#repeat for employment
+#repeat for employment 
 employment <- edi_map_df[, 13]
 
 ##Health -----
